@@ -9,7 +9,7 @@ import coreRoutes from './routes/core.js';
 const app=express();
 app.set('trust proxy', 1);
 const allowedOrigins = [
-  'https://ssm-cham-cong.vercel.app/',
+  'https://ssm-cham-cong.vercel.app',
   'http://localhost:5173'
 ];
 
