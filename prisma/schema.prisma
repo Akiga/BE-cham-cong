@@ -1,0 +1,168 @@
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "mongodb"
+  url      = env("DATABASE_URL")
+}
+
+enum Role {
+  ADMIN
+  MANAGER
+  EMPLOYEE
+}
+
+enum RequestStatus {
+  PENDING
+  APPROVED
+  REJECTED
+}
+
+enum PunchType {
+  CHECK_IN
+  CHECK_OUT
+}
+
+enum OvertimeType {
+  WEEKDAY_15
+  SUNDAY_2
+  SUNDAY_NIGHT_35
+}
+
+model User {
+  id           String   @id @default(auto()) @map("_id") @db.ObjectId
+
+  // Thông tin tài khoản
+  employeeCode String?  @unique
+  fullName     String
+  email        String   @unique
+  passwordHash String
+
+  // Thông tin cá nhân
+  phone        String?
+  gender       String?
+  dateOfBirth  DateTime?
+  address      String?
+
+  // Thông tin công việc
+  department   String?
+  position     String?
+  hireDate     DateTime?
+
+  // Chi nhánh làm việc
+  locationId   String?  @db.ObjectId
+  location     CompanyLocation? @relation(fields: [locationId], references: [id])
+
+  // Phân quyền và lương
+  role         Role     @default(EMPLOYEE)
+  baseSalary   Float    @default(0)
+  active       Boolean  @default(true)
+
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+}
+
+model CompanyLocation {
+  id        String   @id @default(auto()) @map("_id") @db.ObjectId
+  name      String
+  address   String?
+  latitude  Float
+  longitude Float
+  radius    Int      @default(150)
+  active    Boolean  @default(true)
+
+  // Danh sách nhân viên thuộc chi nhánh
+  users     User[]
+
+  createdAt DateTime @default(now())
+}
+
+model WorkShift {
+  id          String   @id @default(auto()) @map("_id") @db.ObjectId
+  name        String
+  startTime   String
+  endTime     String
+  breakMins   Int      @default(0)
+  active      Boolean  @default(true)
+  createdAt   DateTime @default(now())
+}
+
+model AttendanceRecord {
+  id           String    @id @default(auto()) @map("_id") @db.ObjectId
+  userId       String    @db.ObjectId
+  locationId   String?   @db.ObjectId
+  type          PunchType
+  timestamp     DateTime  @default(now())
+  latitude      Float?
+  longitude     Float?
+  distanceM     Float?
+  note          String?
+  source        String?
+  workFraction  Float?
+  createdById   String?   @db.ObjectId
+  updatedById   String?   @db.ObjectId
+  updatedAt     DateTime? @updatedAt
+  createdAt     DateTime  @default(now())
+
+  @@index([userId, timestamp])
+}
+
+model LeaveRequest {
+  id          String        @id @default(auto()) @map("_id") @db.ObjectId
+  userId      String        @db.ObjectId
+  fromDate    DateTime
+  toDate      DateTime
+  reason      String
+  status      RequestStatus @default(PENDING)
+  reviewerId  String?       @db.ObjectId
+  reviewNote  String?
+  createdAt   DateTime      @default(now())
+  updatedAt   DateTime      @updatedAt
+
+  @@index([userId, status])
+}
+
+model OvertimeRequest {
+  id          String        @id @default(auto()) @map("_id") @db.ObjectId
+  userId      String        @db.ObjectId
+  workDate    DateTime
+  hours       Float
+  overtimeType OvertimeType?
+  reason      String
+  status      RequestStatus @default(PENDING)
+  reviewerId  String?       @db.ObjectId
+  reviewNote  String?
+  createdAt   DateTime      @default(now())
+  updatedAt   DateTime      @updatedAt
+
+  @@index([userId, status])
+}
+
+model SalaryRecord {
+  id          String   @id @default(auto()) @map("_id") @db.ObjectId
+  userId      String   @db.ObjectId
+  month       String
+  baseSalary  Float
+  bonus       Float    @default(0)
+  deduction   Float    @default(0)
+  note        String?
+  createdAt   DateTime @default(now())
+
+  @@unique([userId, month])
+}
+
+// Giờ cộng thêm nhập thủ công (ví dụ làm xuyên trưa); KHÔNG phải tăng ca
+model ExtraHourRecord {
+  id          String   @id @default(auto()) @map("_id") @db.ObjectId
+  userId      String   @db.ObjectId
+  locationId  String?  @db.ObjectId
+  workDate    DateTime
+  hours       Float
+  reason      String
+  createdById String?  @db.ObjectId
+  createdAt   DateTime @default(now())
+
+  @@index([userId, workDate])
+}
