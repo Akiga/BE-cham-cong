@@ -4,7 +4,6 @@ import ExcelJS from 'exceljs';
 import { prisma } from '../lib/prisma.js';
 import { auth, allow } from '../middleware/auth.js';
 import { distanceMeters } from '../lib/geo.js';
-import { computeEarlyBonus, sumBonus, vnDayOf } from '../lib/workHours.js';
 
 const router = Router();
 router.use(auth);
@@ -707,15 +706,6 @@ router.get('/attendance', async (req, res, next) => {
       take: 500
     });
 
-    // Gắn giờ cộng thêm (vào sớm hơn giờ bắt đầu ca) vào dòng CHECK_IN của từng ngày
-    const bonus = computeEarlyBonus(rows);
-    const attendanceRows = rows.map(row => ({
-      ...row,
-      earlyBonusHours: row.type === 'CHECK_IN'
-        ? (bonus.get(row.userId)?.get(vnDayOf(row.timestamp)) || 0)
-        : 0
-    }));
-
     // Giờ cộng thêm nhập thủ công được trả về dưới dạng dòng type = 'EXTRA_HOURS'
     const extraWhere = {};
     if (where.userId) extraWhere.userId = where.userId;
@@ -727,7 +717,7 @@ router.get('/attendance', async (req, res, next) => {
     });
 
     res.json([
-      ...attendanceRows,
+      ...rows,
       ...extraRows.map(r => ({
         id: r.id,
         userId: r.userId,
@@ -1291,14 +1281,13 @@ router.get('/payroll', async (req, res, next) => {
             gte: start,
             lt: end
           },
-          type: { in: ['CHECK_IN', 'CHECK_OUT'] },
+          type: 'CHECK_IN',
           ...(visibleIds !== null
             ? { userId: { in: visibleIds } }
             : {})
         },
         select: {
           userId: true,
-          type: true,
           timestamp: true,
           workFraction: true
         }
@@ -1342,14 +1331,12 @@ router.get('/payroll', async (req, res, next) => {
     const workDays = new Map();
     const overtimeTotals = new Map();
     const leaveDays = new Map();
-    // Giờ cộng thêm do vào ca sớm hơn giờ bắt đầu ca (không phải tăng ca)
-    const earlyBonus = computeEarlyBonus(attendance);
+    // Giờ cộng thêm nhập thủ công (không phải tăng ca)
     const manualBonus = await loadManualBonus(start, end, visibleIds);
 
     // Cộng công theo ngày: ngày đủ công = 1, ca nửa ngày = 0.5.
     // Dùng mức cao nhất trong ngày để cặp CHECK_IN/CHECK_OUT không bị cộng đôi.
     attendance.forEach(record => {
-      if (record.type !== 'CHECK_IN') return;
       const day = new Date(record.timestamp).toLocaleDateString('en-CA', {
         timeZone: 'Asia/Ho_Chi_Minh'
       });
@@ -1403,9 +1390,7 @@ router.get('/payroll', async (req, res, next) => {
       overtimeSunday2: Number((overtimeTotals.get(user.id)?.sunday2 || 0).toFixed(2)),
       overtimeSundayNight35: Number((overtimeTotals.get(user.id)?.sundayNight35 || 0).toFixed(2)),
       overtimeHours: Number(((overtimeTotals.get(user.id)?.weekday15 || 0) + (overtimeTotals.get(user.id)?.sunday2 || 0) + (overtimeTotals.get(user.id)?.sundayNight35 || 0)).toFixed(2)),
-      earlyBonusHours: sumBonus(earlyBonus, user.id),
-      manualBonusHours: Number((manualBonus.get(user.id) || 0).toFixed(2)),
-      bonusHours: Number((sumBonus(earlyBonus, user.id) + (manualBonus.get(user.id) || 0)).toFixed(2)),
+      bonusHours: Number((manualBonus.get(user.id) || 0).toFixed(2)),
       leaveDays: leaveDays.get(user.id) || 0
     }));
 
@@ -1501,14 +1486,13 @@ router.get('/payroll/export', managers, async (req, res, next) => {
       prisma.attendanceRecord.findMany({
         where: {
           timestamp: { gte: start, lt: end },
-          type: { in: ['CHECK_IN', 'CHECK_OUT'] },
+          type: 'CHECK_IN',
           ...(visibleIds !== null
             ? { userId: { in: visibleIds } }
             : {})
         },
         select: {
           userId: true,
-          type: true,
           timestamp: true,
           workFraction: true
         }
@@ -1549,12 +1533,10 @@ router.get('/payroll/export', managers, async (req, res, next) => {
     const workDays = new Map();
     const overtimeTotals = new Map();
     const leaveDays = new Map();
-    // Giờ cộng thêm do vào ca sớm hơn giờ bắt đầu ca (không phải tăng ca)
-    const earlyBonus = computeEarlyBonus(attendance);
+    // Giờ cộng thêm nhập thủ công (không phải tăng ca)
     const manualBonus = await loadManualBonus(start, end, visibleIds);
 
     attendance.forEach(record => {
-      if (record.type !== 'CHECK_IN') return;
       const day = new Date(record.timestamp).toLocaleDateString('en-CA', {
         timeZone: 'Asia/Ho_Chi_Minh'
       });
@@ -1603,9 +1585,7 @@ router.get('/payroll/export', managers, async (req, res, next) => {
       { header: 'Phòng ban', key: 'department', width: 22 },
       { header: 'Tháng', key: 'month', width: 14 },
       { header: 'Tổng ngày công', key: 'workDays', width: 18 },
-      { header: 'Giờ cộng thêm (vào sớm)', key: 'earlyBonus', width: 24 },
-      { header: 'Giờ cộng thêm (thủ công)', key: 'manualBonus', width: 26 },
-      { header: 'Tổng giờ cộng thêm', key: 'bonusTotal', width: 22 },
+      { header: 'Giờ cộng thêm', key: 'bonusHours', width: 20 },
       { header: 'Tăng ca x1.5 (giờ)', key: 'weekday15', width: 20 },
       { header: 'Tăng ca x2 (giờ)', key: 'sunday2', width: 20 },
       { header: 'Tăng ca x3.5 (giờ)', key: 'sundayNight35', width: 22 },
@@ -1620,9 +1600,7 @@ router.get('/payroll/export', managers, async (req, res, next) => {
         department: user.department || '',
         month,
         workDays: Number([...(workDays.get(user.id)?.values() || [])].reduce((sum, value) => sum + value, 0).toFixed(2)),
-        earlyBonus: sumBonus(earlyBonus, user.id),
-        manualBonus: Number((manualBonus.get(user.id) || 0).toFixed(2)),
-        bonusTotal: Number((sumBonus(earlyBonus, user.id) + (manualBonus.get(user.id) || 0)).toFixed(2)),
+        bonusHours: Number((manualBonus.get(user.id) || 0).toFixed(2)),
         weekday15: Number((overtimeTotals.get(user.id)?.weekday15 || 0).toFixed(2)),
         sunday2: Number((overtimeTotals.get(user.id)?.sunday2 || 0).toFixed(2)),
         sundayNight35: Number((overtimeTotals.get(user.id)?.sundayNight35 || 0).toFixed(2)),
@@ -1641,7 +1619,7 @@ router.get('/payroll/export', managers, async (req, res, next) => {
     ws.views = [{ state: 'frozen', ySplit: 1 }];
     ws.autoFilter = {
       from: 'A1',
-      to: 'M1'
+      to: 'K1'
     };
 
     res.setHeader(
