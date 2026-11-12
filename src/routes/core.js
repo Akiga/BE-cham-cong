@@ -4,6 +4,7 @@ import ExcelJS from 'exceljs';
 import { prisma } from '../lib/prisma.js';
 import { auth, allow } from '../middleware/auth.js';
 import { distanceMeters } from '../lib/geo.js';
+import { calcSalary, TAX_RATE } from '../lib/payroll.js';
 
 const router = Router();
 router.use(auth);
@@ -22,6 +23,126 @@ async function loadManualBonus(start, end, visibleIds) {
   const totals = new Map();
   rows.forEach(r => totals.set(r.userId, (totals.get(r.userId) || 0) + Number(r.hours || 0)));
   return totals;
+}
+
+function isValidMonth(month) {
+  if (!/^\d{4}-\d{2}$/.test(month)) return false;
+  const monthNumber = Number(month.split('-')[1]);
+  return monthNumber >= 1 && monthNumber <= 12;
+}
+
+// Tổng hợp công, giờ cộng thêm, tăng ca, nghỉ phép và tiền lương của một tháng.
+// Phạm vi nhân viên phụ thuộc vào tài khoản đang đăng nhập.
+async function buildPayrollRows(month, authUser) {
+  const [year, monthNumber] = month.split('-').map(Number);
+  const start = new Date(Date.UTC(year, monthNumber - 1, 1));
+  const end = new Date(Date.UTC(year, monthNumber, 1));
+
+  const visibleIds = await getVisibleUserIds(authUser);
+  const scope = visibleIds !== null ? { userId: { in: visibleIds } } : {};
+
+  const [users, attendance, overtime, leaves] = await Promise.all([
+    prisma.user.findMany({
+      where: {
+        role: 'EMPLOYEE',
+        ...(visibleIds !== null ? { id: { in: visibleIds } } : {})
+      },
+      select: {
+        id: true,
+        fullName: true,
+        employeeCode: true,
+        department: true,
+        position: true,
+        baseSalary: true
+      },
+      orderBy: { fullName: 'asc' }
+    }),
+
+    prisma.attendanceRecord.findMany({
+      where: { timestamp: { gte: start, lt: end }, type: 'CHECK_IN', ...scope },
+      select: { userId: true, timestamp: true, workFraction: true }
+    }),
+
+    prisma.overtimeRequest.findMany({
+      where: { status: 'APPROVED', workDate: { gte: start, lt: end }, ...scope },
+      select: { userId: true, hours: true, overtimeType: true }
+    }),
+
+    prisma.leaveRequest.findMany({
+      where: { status: 'APPROVED', fromDate: { lt: end }, toDate: { gte: start }, ...scope },
+      select: { userId: true, fromDate: true, toDate: true }
+    })
+  ]);
+
+  // Giờ cộng thêm nhập thủ công (không phải tăng ca)
+  const manualBonus = await loadManualBonus(start, end, visibleIds);
+
+  // Cộng công theo ngày: ngày đủ công = 1, ca nửa ngày = 0.5.
+  // Dùng mức cao nhất trong ngày để cặp CHECK_IN/CHECK_OUT không bị cộng đôi.
+  const workDays = new Map();
+  attendance.forEach(record => {
+    const day = new Date(record.timestamp).toLocaleDateString('en-CA', {
+      timeZone: 'Asia/Ho_Chi_Minh'
+    });
+    if (!workDays.has(record.userId)) workDays.set(record.userId, new Map());
+    const daily = workDays.get(record.userId);
+    const fraction = Number(record.workFraction ?? 1);
+    daily.set(day, Math.max(daily.get(day) || 0, fraction));
+  });
+
+  // Cộng giờ tăng ca đã được duyệt theo loại đăng ký
+  const overtimeTotals = new Map();
+  overtime.forEach(record => {
+    const totals = overtimeTotals.get(record.userId) || { weekday15: 0, sunday2: 0, sundayNight35: 0 };
+    const hours = Number(record.hours || 0);
+    if (record.overtimeType === 'WEEKDAY_15') totals.weekday15 += hours;
+    if (record.overtimeType === 'SUNDAY_2') totals.sunday2 += hours;
+    if (record.overtimeType === 'SUNDAY_NIGHT_35') totals.sundayNight35 += hours;
+    overtimeTotals.set(record.userId, totals);
+  });
+
+  // Tính số ngày nghỉ đã được duyệt, tính cả ngày bắt đầu và kết thúc
+  const leaveDays = new Map();
+  leaves.forEach(record => {
+    const from = Math.max(new Date(record.fromDate).getTime(), start.getTime());
+    const to = Math.min(new Date(record.toDate).getTime(), end.getTime() - 86400000);
+    if (to < from) return;
+
+    const days = Math.floor((to - from) / 86400000) + 1;
+    leaveDays.set(record.userId, (leaveDays.get(record.userId) || 0) + days);
+  });
+
+  return users.map(user => {
+    const ot = overtimeTotals.get(user.id) || { weekday15: 0, sunday2: 0, sundayNight35: 0 };
+    const totalWorkDays = [...(workDays.get(user.id)?.values() || [])].reduce((sum, value) => sum + value, 0);
+    const bonusHours = manualBonus.get(user.id) || 0;
+
+    const salary = calcSalary({
+      baseSalary: user.baseSalary,
+      workDays: totalWorkDays,
+      bonusHours,
+      overtime: ot
+    });
+
+    return {
+      id: user.id,
+      fullName: user.fullName,
+      employeeCode: user.employeeCode,
+      department: user.department,
+      position: user.position,
+      month,
+      totalWorkDays,
+      bonusHours,
+      overtimeWeekday15: ot.weekday15,
+      overtimeSunday2: ot.sunday2,
+      overtimeSundayNight35: ot.sundayNight35,
+      overtimeHours: ot.weekday15 + ot.sunday2 + ot.sundayNight35,
+      leaveDays: leaveDays.get(user.id) || 0,
+      baseSalary: Number(user.baseSalary) || 0,
+      taxRate: TAX_RATE,
+      ...salary
+    };
+  });
 }
 
 // Lấy danh sách ID nhân viên mà tài khoản hiện tại được phép xem
@@ -1225,7 +1346,7 @@ router.patch('/overtime/:id/review', managers, async (req, res, next) => {
   }
 });
 
-// Tổng hợp ngày công, giờ tăng ca và ngày nghỉ theo tháng
+// Tổng hợp ngày công, giờ tăng ca, ngày nghỉ và tiền lương theo tháng
 router.get('/payroll', async (req, res, next) => {
   if (!['ADMIN', 'MANAGER', 'EMPLOYEE'].includes(req.user.role)) {
     return res.status(403).json({
@@ -1236,165 +1357,14 @@ router.get('/payroll', async (req, res, next) => {
   try {
     const month = String(req.query.month || '');
 
-    if (!/^\d{4}-\d{2}$/.test(month)) {
+    if (!isValidMonth(month)) {
       return res.status(400).json({
         message: 'Tháng không hợp lệ'
       });
     }
 
-    const [year, monthNumber] = month.split('-').map(Number);
-
-    if (monthNumber < 1 || monthNumber > 12) {
-      return res.status(400).json({
-        message: 'Tháng không hợp lệ'
-      });
-    }
-
-    const start = new Date(Date.UTC(year, monthNumber - 1, 1));
-    const end = new Date(Date.UTC(year, monthNumber, 1));
-
-    const visibleIds = await getVisibleUserIds(req.user);
-
-    const employeeWhere = {
-      role: 'EMPLOYEE',
-      ...(visibleIds !== null
-        ? { id: { in: visibleIds } }
-        : {})
-    };
-
-    const [users, attendance, overtime, leaves] = await Promise.all([
-      prisma.user.findMany({
-        where: employeeWhere,
-        select: {
-          id: true,
-          fullName: true,
-          employeeCode: true,
-          department: true,
-          position: true
-        },
-        orderBy: { fullName: 'asc' }
-      }),
-
-      prisma.attendanceRecord.findMany({
-        where: {
-          timestamp: {
-            gte: start,
-            lt: end
-          },
-          type: 'CHECK_IN',
-          ...(visibleIds !== null
-            ? { userId: { in: visibleIds } }
-            : {})
-        },
-        select: {
-          userId: true,
-          timestamp: true,
-          workFraction: true
-        }
-      }),
-
-      prisma.overtimeRequest.findMany({
-        where: {
-          status: 'APPROVED',
-          workDate: {
-            gte: start,
-            lt: end
-          },
-          ...(visibleIds !== null
-            ? { userId: { in: visibleIds } }
-            : {})
-        },
-        select: {
-          userId: true,
-          hours: true,
-          overtimeType: true
-        }
-      }),
-
-      prisma.leaveRequest.findMany({
-        where: {
-          status: 'APPROVED',
-          fromDate: { lt: end },
-          toDate: { gte: start },
-          ...(visibleIds !== null
-            ? { userId: { in: visibleIds } }
-            : {})
-        },
-        select: {
-          userId: true,
-          fromDate: true,
-          toDate: true
-        }
-      })
-    ]);
-
-    const workDays = new Map();
-    const overtimeTotals = new Map();
-    const leaveDays = new Map();
-    // Giờ cộng thêm nhập thủ công (không phải tăng ca)
-    const manualBonus = await loadManualBonus(start, end, visibleIds);
-
-    // Cộng công theo ngày: ngày đủ công = 1, ca nửa ngày = 0.5.
-    // Dùng mức cao nhất trong ngày để cặp CHECK_IN/CHECK_OUT không bị cộng đôi.
-    attendance.forEach(record => {
-      const day = new Date(record.timestamp).toLocaleDateString('en-CA', {
-        timeZone: 'Asia/Ho_Chi_Minh'
-      });
-      if (!workDays.has(record.userId)) workDays.set(record.userId, new Map());
-      const daily = workDays.get(record.userId);
-      const fraction = Number(record.workFraction ?? 1);
-      daily.set(day, Math.max(daily.get(day) || 0, fraction));
-    });
-
-    // Cộng giờ tăng ca đã được duyệt theo loại đăng ký
-    overtime.forEach(record => {
-      const totals = overtimeTotals.get(record.userId) || { weekday15: 0, sunday2: 0, sundayNight35: 0 };
-      const hours = Number(record.hours || 0);
-      if (record.overtimeType === 'WEEKDAY_15') totals.weekday15 += hours;
-      if (record.overtimeType === 'SUNDAY_2') totals.sunday2 += hours;
-      if (record.overtimeType === 'SUNDAY_NIGHT_35') totals.sundayNight35 += hours;
-      overtimeTotals.set(record.userId, totals);
-    });
-
-    // Tính số ngày nghỉ đã được duyệt, tính cả ngày bắt đầu và kết thúc
-    leaves.forEach(record => {
-      const from = Math.max(
-        new Date(record.fromDate).getTime(),
-        start.getTime()
-      );
-
-      const to = Math.min(
-        new Date(record.toDate).getTime(),
-        end.getTime() - 86400000
-      );
-
-      if (to < from) return;
-
-      const days = Math.floor((to - from) / 86400000) + 1;
-
-      leaveDays.set(
-        record.userId,
-        (leaveDays.get(record.userId) || 0) + days
-      );
-    });
-
-    const result = users.map(user => ({
-      id: user.id,
-      fullName: user.fullName,
-      employeeCode: user.employeeCode,
-      department: user.department,
-      position: user.position,
-      month,
-      totalWorkDays: Number([...(workDays.get(user.id)?.values() || [])].reduce((sum, value) => sum + value, 0).toFixed(2)),
-      overtimeWeekday15: Number((overtimeTotals.get(user.id)?.weekday15 || 0).toFixed(2)),
-      overtimeSunday2: Number((overtimeTotals.get(user.id)?.sunday2 || 0).toFixed(2)),
-      overtimeSundayNight35: Number((overtimeTotals.get(user.id)?.sundayNight35 || 0).toFixed(2)),
-      overtimeHours: Number(((overtimeTotals.get(user.id)?.weekday15 || 0) + (overtimeTotals.get(user.id)?.sunday2 || 0) + (overtimeTotals.get(user.id)?.sundayNight35 || 0)).toFixed(2)),
-      bonusHours: Number((manualBonus.get(user.id) || 0).toFixed(2)),
-      leaveDays: leaveDays.get(user.id) || 0
-    }));
-
-    res.json(result);
+    // Admin xem tất cả, Manager xem nhân viên trong chi nhánh, nhân viên chỉ xem của mình
+    res.json(await buildPayrollRows(month, req.user));
   } catch (error) {
     next(error);
   }
@@ -1446,144 +1416,26 @@ router.post('/payroll', admins, async (req, res) => {
   }
 });
 
-// Xuất bảng lương trong phạm vi được phép ra tệp Excel
+// Xuất bảng công / bảng lương trong phạm vi được phép ra tệp Excel
+// type=timesheet: bảng công, type=salary: bảng lương, bỏ trống: gộp cả hai
 router.get('/payroll/export', managers, async (req, res, next) => {
   try {
     const month = String(req.query.month || '');
+    const type = ['timesheet', 'salary'].includes(req.query.type) ? req.query.type : 'all';
 
-    if (!/^\d{4}-\d{2}$/.test(month)) {
+    if (!isValidMonth(month)) {
       return res.status(400).json({ message: 'Tháng không hợp lệ' });
     }
 
-    const [year, monthNumber] = month.split('-').map(Number);
+    const payrollRows = await buildPayrollRows(month, req.user);
 
-    if (monthNumber < 1 || monthNumber > 12) {
-      return res.status(400).json({ message: 'Tháng không hợp lệ' });
-    }
-
-    const start = new Date(Date.UTC(year, monthNumber - 1, 1));
-    const end = new Date(Date.UTC(year, monthNumber, 1));
-
-    const visibleIds = await getVisibleUserIds(req.user);
-
-    const employeeWhere = {
-      role: 'EMPLOYEE',
-      ...(visibleIds !== null ? { id: { in: visibleIds } } : {})
-    };
-
-    const [users, attendance, overtime, leaves] = await Promise.all([
-      prisma.user.findMany({
-        where: employeeWhere,
-        select: {
-          id: true,
-          fullName: true,
-          employeeCode: true,
-          department: true
-        },
-        orderBy: { fullName: 'asc' }
-      }),
-
-      prisma.attendanceRecord.findMany({
-        where: {
-          timestamp: { gte: start, lt: end },
-          type: 'CHECK_IN',
-          ...(visibleIds !== null
-            ? { userId: { in: visibleIds } }
-            : {})
-        },
-        select: {
-          userId: true,
-          timestamp: true,
-          workFraction: true
-        }
-      }),
-
-      prisma.overtimeRequest.findMany({
-        where: {
-          status: 'APPROVED',
-          workDate: { gte: start, lt: end },
-          ...(visibleIds !== null
-            ? { userId: { in: visibleIds } }
-            : {})
-        },
-        select: {
-          userId: true,
-          hours: true,
-          overtimeType: true
-        }
-      }),
-
-      prisma.leaveRequest.findMany({
-        where: {
-          status: 'APPROVED',
-          fromDate: { lt: end },
-          toDate: { gte: start },
-          ...(visibleIds !== null
-            ? { userId: { in: visibleIds } }
-            : {})
-        },
-        select: {
-          userId: true,
-          fromDate: true,
-          toDate: true
-        }
-      })
-    ]);
-
-    const workDays = new Map();
-    const overtimeTotals = new Map();
-    const leaveDays = new Map();
-    // Giờ cộng thêm nhập thủ công (không phải tăng ca)
-    const manualBonus = await loadManualBonus(start, end, visibleIds);
-
-    attendance.forEach(record => {
-      const day = new Date(record.timestamp).toLocaleDateString('en-CA', {
-        timeZone: 'Asia/Ho_Chi_Minh'
-      });
-      if (!workDays.has(record.userId)) workDays.set(record.userId, new Map());
-      const daily = workDays.get(record.userId);
-      const fraction = Number(record.workFraction ?? 1);
-      daily.set(day, Math.max(daily.get(day) || 0, fraction));
-    });
-
-    overtime.forEach(record => {
-      const totals = overtimeTotals.get(record.userId) || { weekday15: 0, sunday2: 0, sundayNight35: 0 };
-      const hours = Number(record.hours || 0);
-      if (record.overtimeType === 'WEEKDAY_15') totals.weekday15 += hours;
-      if (record.overtimeType === 'SUNDAY_2') totals.sunday2 += hours;
-      if (record.overtimeType === 'SUNDAY_NIGHT_35') totals.sundayNight35 += hours;
-      overtimeTotals.set(record.userId, totals);
-    });
-
-    leaves.forEach(record => {
-      const from = Math.max(
-        new Date(record.fromDate).getTime(),
-        start.getTime()
-      );
-
-      const to = Math.min(
-        new Date(record.toDate).getTime(),
-        end.getTime() - 86400000
-      );
-
-      if (to < from) return;
-
-      const days = Math.floor((to - from) / 86400000) + 1;
-
-      leaveDays.set(
-        record.userId,
-        (leaveDays.get(record.userId) || 0) + days
-      );
-    });
-
-    const wb = new ExcelJS.Workbook();
-    const ws = wb.addWorksheet('Tong hop cong');
-
-    ws.columns = [
+    const identityCols = [
       { header: 'Họ tên nhân viên', key: 'name', width: 28 },
       { header: 'Mã nhân viên', key: 'code', width: 18 },
       { header: 'Phòng ban', key: 'department', width: 22 },
-      { header: 'Tháng', key: 'month', width: 14 },
+      { header: 'Tháng', key: 'month', width: 14 }
+    ];
+    const timesheetCols = [
       { header: 'Tổng ngày công', key: 'workDays', width: 18 },
       { header: 'Giờ cộng thêm', key: 'bonusHours', width: 20 },
       { header: 'Tăng ca x1.5 (giờ)', key: 'weekday15', width: 20 },
@@ -1592,35 +1444,70 @@ router.get('/payroll/export', managers, async (req, res, next) => {
       { header: 'Tổng giờ tăng ca', key: 'overtime', width: 20 },
       { header: 'Tổng ngày nghỉ', key: 'leaveDays', width: 18 }
     ];
+    const salaryCols = [
+      { header: 'Lương cơ bản', key: 'baseSalary', width: 18 },
+      { header: 'Lương theo công', key: 'workPay', width: 20 },
+      { header: 'Tiền giờ cộng thêm', key: 'bonusPay', width: 20 },
+      { header: 'Tiền tăng ca', key: 'overtimePay', width: 18 },
+      { header: 'Tổng thu nhập', key: 'grossPay', width: 20 },
+      { header: 'Thuế thu nhập (10%)', key: 'tax', width: 20 },
+      { header: 'Thực nhận', key: 'netPay', width: 20 }
+    ];
+    const moneyKeys = salaryCols.map(col => col.key);
 
-    users.forEach(user => {
+    const columns = [
+      ...identityCols,
+      ...(type !== 'salary' ? timesheetCols : []),
+      ...(type !== 'timesheet' ? salaryCols : [])
+    ];
+
+    const wb = new ExcelJS.Workbook();
+    const ws = wb.addWorksheet(type === 'salary' ? 'Bang luong' : type === 'timesheet' ? 'Bang cong' : 'Tong hop cong');
+    ws.columns = columns;
+
+    payrollRows.forEach(r => {
       ws.addRow({
-        name: user.fullName || '',
-        code: user.employeeCode || '',
-        department: user.department || '',
+        name: r.fullName || '',
+        code: r.employeeCode || '',
+        department: r.department || '',
         month,
-        workDays: Number([...(workDays.get(user.id)?.values() || [])].reduce((sum, value) => sum + value, 0).toFixed(2)),
-        bonusHours: Number((manualBonus.get(user.id) || 0).toFixed(2)),
-        weekday15: Number((overtimeTotals.get(user.id)?.weekday15 || 0).toFixed(2)),
-        sunday2: Number((overtimeTotals.get(user.id)?.sunday2 || 0).toFixed(2)),
-        sundayNight35: Number((overtimeTotals.get(user.id)?.sundayNight35 || 0).toFixed(2)),
-        overtime: Number(((overtimeTotals.get(user.id)?.weekday15 || 0) + (overtimeTotals.get(user.id)?.sunday2 || 0) + (overtimeTotals.get(user.id)?.sundayNight35 || 0)).toFixed(2)),
-        leaveDays: leaveDays.get(user.id) || 0
+        workDays: r.totalWorkDays,
+        bonusHours: r.bonusHours,
+        weekday15: r.overtimeWeekday15,
+        sunday2: r.overtimeSunday2,
+        sundayNight35: r.overtimeSundayNight35,
+        overtime: r.overtimeHours,
+        leaveDays: r.leaveDays,
+        baseSalary: r.baseSalary,
+        workPay: r.workPay,
+        bonusPay: r.bonusPay,
+        overtimePay: r.overtimePay,
+        grossPay: r.grossPay,
+        tax: r.tax,
+        netPay: r.netPay
       });
+    });
+
+    // Cột tiền hiển thị 2 số lẻ nhưng giá trị trong ô không bị làm tròn
+    columns.filter(col => moneyKeys.includes(col.key)).forEach(col => {
+      ws.getColumn(col.key).numFmt = '#,##0.00';
     });
 
     // Định dạng tiêu đề
     ws.getRow(1).font = { bold: true };
     ws.getRow(1).alignment = {
       horizontal: 'center',
-      vertical: 'middle'
+      vertical: 'middle',
+      wrapText: true
     };
 
     ws.views = [{ state: 'frozen', ySplit: 1 }];
     ws.autoFilter = {
       from: 'A1',
-      to: 'K1'
+      to: `${ws.getColumn(columns.length).letter}1`
     };
+
+    const fileName = type === 'salary' ? 'bang-luong' : type === 'timesheet' ? 'bang-cong' : 'tong-hop-cong';
 
     res.setHeader(
       'Content-Type',
@@ -1629,7 +1516,7 @@ router.get('/payroll/export', managers, async (req, res, next) => {
 
     res.setHeader(
       'Content-Disposition',
-      `attachment; filename="tong-hop-cong-${month}.xlsx"`
+      `attachment; filename="${fileName}-${month}.xlsx"`
     );
 
     await wb.xlsx.write(res);
