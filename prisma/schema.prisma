@@ -55,9 +55,8 @@ model User {
   locationId   String?  @db.ObjectId
   location     CompanyLocation? @relation(fields: [locationId], references: [id])
 
-  // Phân quyền và lương
+  // Phân quyền
   role         Role     @default(EMPLOYEE)
-  baseSalary   Float    @default(0)
   active       Boolean  @default(true)
 
   createdAt    DateTime @default(now())
@@ -138,19 +137,6 @@ model OvertimeRequest {
   updatedAt   DateTime      @updatedAt
 
   @@index([userId, status])
-}
-
-model SalaryRecord {
-  id          String   @id @default(auto()) @map("_id") @db.ObjectId
-  userId      String   @db.ObjectId
-  month       String
-  baseSalary  Float
-  bonus       Float    @default(0)
-  deduction   Float    @default(0)
-  note        String?
-  createdAt   DateTime @default(now())
-
-  @@unique([userId, month])
 }
 
 // Giờ cộng thêm nhập thủ công (ví dụ làm xuyên trưa); KHÔNG phải tăng ca

@@ -19,7 +19,6 @@ const userSelect = {
   position: true,
   hireDate: true,
   role: true,
-  baseSalary: true,
   active: true,
   locationId: true,
   location: {

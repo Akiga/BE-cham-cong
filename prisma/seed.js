@@ -35,8 +35,7 @@ try {
         fullName: process.env.ADMIN_NAME || 'Quản trị viên',
         email,
         passwordHash,
-        role: 'ADMIN',
-        baseSalary: 0
+        role: 'ADMIN'
       }
     });
 

@@ -4,7 +4,6 @@ import ExcelJS from 'exceljs';
 import { prisma } from '../lib/prisma.js';
 import { auth, allow } from '../middleware/auth.js';
 import { distanceMeters } from '../lib/geo.js';
-import { calcSalary, TAX_RATE } from '../lib/payroll.js';
 
 const router = Router();
 router.use(auth);
@@ -31,9 +30,9 @@ function isValidMonth(month) {
   return monthNumber >= 1 && monthNumber <= 12;
 }
 
-// Tổng hợp công, giờ cộng thêm, tăng ca, nghỉ phép và tiền lương của một tháng.
+// Tổng hợp công, giờ cộng thêm, tăng ca và nghỉ phép của một tháng.
 // Phạm vi nhân viên phụ thuộc vào tài khoản đang đăng nhập.
-async function buildPayrollRows(month, authUser) {
+async function buildTimesheetRows(month, authUser) {
   const [year, monthNumber] = month.split('-').map(Number);
   const start = new Date(Date.UTC(year, monthNumber - 1, 1));
   const end = new Date(Date.UTC(year, monthNumber, 1));
@@ -52,8 +51,7 @@ async function buildPayrollRows(month, authUser) {
         fullName: true,
         employeeCode: true,
         department: true,
-        position: true,
-        baseSalary: true
+        position: true
       },
       orderBy: { fullName: 'asc' }
     }),
@@ -117,13 +115,6 @@ async function buildPayrollRows(month, authUser) {
     const totalWorkDays = [...(workDays.get(user.id)?.values() || [])].reduce((sum, value) => sum + value, 0);
     const bonusHours = manualBonus.get(user.id) || 0;
 
-    const salary = calcSalary({
-      baseSalary: user.baseSalary,
-      workDays: totalWorkDays,
-      bonusHours,
-      overtime: ot
-    });
-
     return {
       id: user.id,
       fullName: user.fullName,
@@ -137,10 +128,7 @@ async function buildPayrollRows(month, authUser) {
       overtimeSunday2: ot.sunday2,
       overtimeSundayNight35: ot.sundayNight35,
       overtimeHours: ot.weekday15 + ot.sunday2 + ot.sundayNight35,
-      leaveDays: leaveDays.get(user.id) || 0,
-      baseSalary: Number(user.baseSalary) || 0,
-      taxRate: TAX_RATE,
-      ...salary
+      leaveDays: leaveDays.get(user.id) || 0
     };
   });
 }
@@ -321,7 +309,6 @@ router.get('/employees', managers, async (req, res, next) => {
         position: true,
         hireDate: true,
         role: true,
-        baseSalary: true,
         active: true,
         locationId: true,
         location: {
@@ -357,7 +344,6 @@ router.post('/employees', admins, async (req, res, next) => {
       position,
       hireDate,
       role = 'EMPLOYEE',
-      baseSalary = 0,
       locationId
     } = req.body || {};
 
@@ -376,12 +362,6 @@ router.post('/employees', admins, async (req, res, next) => {
     if (!['ADMIN', 'MANAGER', 'EMPLOYEE'].includes(role)) {
       return res.status(400).json({
         message: 'Vai trò không hợp lệ'
-      });
-    }
-
-    if (!Number.isFinite(Number(baseSalary)) || Number(baseSalary) < 0) {
-      return res.status(400).json({
-        message: 'Mức lương không hợp lệ'
       });
     }
 
@@ -446,7 +426,6 @@ router.post('/employees', admins, async (req, res, next) => {
         position: position || null,
         hireDate: hireDate ? new Date(hireDate) : null,
         role,
-        baseSalary: Number(baseSalary),
         locationId: locationId || null
       },
       select: {
@@ -487,7 +466,6 @@ router.patch('/employees/:id', admins, async (req, res, next) => {
       position,
       hireDate,
       role,
-      baseSalary,
       locationId,
       active
     } = req.body || {};
@@ -561,21 +539,11 @@ router.patch('/employees/:id', admins, async (req, res, next) => {
         ? undefined
         : hireDate ? new Date(hireDate) : null,
       role,
-      baseSalary: baseSalary === undefined
-        ? undefined
-        : Number(baseSalary),
       locationId: locationId === undefined
         ? undefined
         : nextLocationId,
       active
     };
-
-    if (data.baseSalary !== undefined &&
-        (!Number.isFinite(data.baseSalary) || data.baseSalary < 0)) {
-      return res.status(400).json({
-        message: 'Mức lương không hợp lệ'
-      });
-    }
 
     const row = await prisma.user.update({
       where: { id: req.params.id },
@@ -593,7 +561,6 @@ router.patch('/employees/:id', admins, async (req, res, next) => {
         position: true,
         hireDate: true,
         role: true,
-        baseSalary: true,
         active: true,
         locationId: true,
         location: {
@@ -1346,8 +1313,8 @@ router.patch('/overtime/:id/review', managers, async (req, res, next) => {
   }
 });
 
-// Tổng hợp ngày công, giờ tăng ca, ngày nghỉ và tiền lương theo tháng
-router.get('/payroll', async (req, res, next) => {
+// Tổng hợp ngày công, giờ cộng thêm, giờ tăng ca và ngày nghỉ theo tháng
+router.get('/timesheet', async (req, res, next) => {
   if (!['ADMIN', 'MANAGER', 'EMPLOYEE'].includes(req.user.role)) {
     return res.status(403).json({
       message: 'Bạn không có quyền xem bảng tổng hợp công'
@@ -1364,78 +1331,28 @@ router.get('/payroll', async (req, res, next) => {
     }
 
     // Admin xem tất cả, Manager xem nhân viên trong chi nhánh, nhân viên chỉ xem của mình
-    res.json(await buildPayrollRows(month, req.user));
+    res.json(await buildTimesheetRows(month, req.user));
   } catch (error) {
     next(error);
   }
 });
 
-// Tạo mới hoặc cập nhật bảng lương; chỉ Admin được phép thực hiện
-router.post('/payroll', admins, async (req, res) => {
-  const {
-    userId,
-    month,
-    baseSalary,
-    bonus = 0,
-    deduction = 0,
-    note
-  } = req.body || {};
-
-  if (!userId || !month) {
-    return res.status(400).json({
-      message: 'Thiếu nhân viên hoặc tháng'
-    });
-  }
-
-  try {
-    const salaryRecord = await prisma.salaryRecord.upsert({
-      where: {
-        userId_month: { userId, month }
-      },
-      create: {
-        userId,
-        month,
-        baseSalary: Number(baseSalary) || 0,
-        bonus: Number(bonus) || 0,
-        deduction: Number(deduction) || 0,
-        note
-      },
-      update: {
-        baseSalary: Number(baseSalary) || 0,
-        bonus: Number(bonus) || 0,
-        deduction: Number(deduction) || 0,
-        note
-      }
-    });
-
-    res.status(201).json(salaryRecord);
-  } catch {
-    res.status(400).json({
-      message: 'Không thể lưu bảng lương'
-    });
-  }
-});
-
-// Xuất bảng công / bảng lương trong phạm vi được phép ra tệp Excel
-// type=timesheet: bảng công, type=salary: bảng lương, bỏ trống: gộp cả hai
-router.get('/payroll/export', managers, async (req, res, next) => {
+// Xuất bảng công trong phạm vi được phép ra tệp Excel
+router.get('/timesheet/export', managers, async (req, res, next) => {
   try {
     const month = String(req.query.month || '');
-    const type = ['timesheet', 'salary'].includes(req.query.type) ? req.query.type : 'all';
 
     if (!isValidMonth(month)) {
       return res.status(400).json({ message: 'Tháng không hợp lệ' });
     }
 
-    const payrollRows = await buildPayrollRows(month, req.user);
+    const rows = await buildTimesheetRows(month, req.user);
 
-    const identityCols = [
+    const columns = [
       { header: 'Họ tên nhân viên', key: 'name', width: 28 },
       { header: 'Mã nhân viên', key: 'code', width: 18 },
       { header: 'Phòng ban', key: 'department', width: 22 },
-      { header: 'Tháng', key: 'month', width: 14 }
-    ];
-    const timesheetCols = [
+      { header: 'Tháng', key: 'month', width: 14 },
       { header: 'Tổng ngày công', key: 'workDays', width: 18 },
       { header: 'Giờ cộng thêm', key: 'bonusHours', width: 20 },
       { header: 'Tăng ca x1.5 (giờ)', key: 'weekday15', width: 20 },
@@ -1444,28 +1361,12 @@ router.get('/payroll/export', managers, async (req, res, next) => {
       { header: 'Tổng giờ tăng ca', key: 'overtime', width: 20 },
       { header: 'Tổng ngày nghỉ', key: 'leaveDays', width: 18 }
     ];
-    const salaryCols = [
-      { header: 'Lương cơ bản', key: 'baseSalary', width: 18 },
-      { header: 'Lương theo công', key: 'workPay', width: 20 },
-      { header: 'Tiền giờ cộng thêm', key: 'bonusPay', width: 20 },
-      { header: 'Tiền tăng ca', key: 'overtimePay', width: 18 },
-      { header: 'Tổng thu nhập', key: 'grossPay', width: 20 },
-      { header: 'Thuế thu nhập (10%)', key: 'tax', width: 20 },
-      { header: 'Thực nhận', key: 'netPay', width: 20 }
-    ];
-    const moneyKeys = salaryCols.map(col => col.key);
-
-    const columns = [
-      ...identityCols,
-      ...(type !== 'salary' ? timesheetCols : []),
-      ...(type !== 'timesheet' ? salaryCols : [])
-    ];
 
     const wb = new ExcelJS.Workbook();
-    const ws = wb.addWorksheet(type === 'salary' ? 'Bang luong' : type === 'timesheet' ? 'Bang cong' : 'Tong hop cong');
+    const ws = wb.addWorksheet('Bang cong');
     ws.columns = columns;
 
-    payrollRows.forEach(r => {
+    rows.forEach(r => {
       ws.addRow({
         name: r.fullName || '',
         code: r.employeeCode || '',
@@ -1477,20 +1378,8 @@ router.get('/payroll/export', managers, async (req, res, next) => {
         sunday2: r.overtimeSunday2,
         sundayNight35: r.overtimeSundayNight35,
         overtime: r.overtimeHours,
-        leaveDays: r.leaveDays,
-        baseSalary: r.baseSalary,
-        workPay: r.workPay,
-        bonusPay: r.bonusPay,
-        overtimePay: r.overtimePay,
-        grossPay: r.grossPay,
-        tax: r.tax,
-        netPay: r.netPay
+        leaveDays: r.leaveDays
       });
-    });
-
-    // Cột tiền hiển thị 2 số lẻ nhưng giá trị trong ô không bị làm tròn
-    columns.filter(col => moneyKeys.includes(col.key)).forEach(col => {
-      ws.getColumn(col.key).numFmt = '#,##0.00';
     });
 
     // Định dạng tiêu đề
@@ -1507,8 +1396,6 @@ router.get('/payroll/export', managers, async (req, res, next) => {
       to: `${ws.getColumn(columns.length).letter}1`
     };
 
-    const fileName = type === 'salary' ? 'bang-luong' : type === 'timesheet' ? 'bang-cong' : 'tong-hop-cong';
-
     res.setHeader(
       'Content-Type',
       'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
@@ -1516,7 +1403,7 @@ router.get('/payroll/export', managers, async (req, res, next) => {
 
     res.setHeader(
       'Content-Disposition',
-      `attachment; filename="${fileName}-${month}.xlsx"`
+      `attachment; filename="bang-cong-${month}.xlsx"`
     );
 
     await wb.xlsx.write(res);

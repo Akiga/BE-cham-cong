@@ -20,20 +20,43 @@ export const OVERTIME_MULTIPLIERS = {
  *  - Tăng ca         = lương giờ × giờ × hệ số (x1.5 / x2 / x3.5)
  *  - Thuế            = 10% tổng thu nhập
  */
-export function calcSalary({ baseSalary, workDays, bonusHours, overtime }) {
+export function calcSalary({
+  baseSalary,
+  workDays,
+  bonusHours,
+  overtime,
+  dailyAllowance = 0
+}) {
   const base = Number(baseSalary) || 0;
+  const days = Number(workDays) || 0;
+  const allowance = Number(dailyAllowance) || 0;
+
   const dailyRate = base / STANDARD_WORK_DAYS;
   const hourlyRate = dailyRate / HOURS_PER_DAY;
 
-  const workPay = dailyRate * workDays;
-  const bonusPay = hourlyRate * bonusHours;
+  const workPay = dailyRate * days;
+  const bonusPay = hourlyRate * (Number(bonusHours) || 0);
+
   const overtimePay = hourlyRate * (
-    overtime.weekday15 * OVERTIME_MULTIPLIERS.weekday15 +
-    overtime.sunday2 * OVERTIME_MULTIPLIERS.sunday2 +
-    overtime.sundayNight35 * OVERTIME_MULTIPLIERS.sundayNight35
+    (Number(overtime.weekday15) || 0) * OVERTIME_MULTIPLIERS.weekday15 +
+    (Number(overtime.sunday2) || 0) * OVERTIME_MULTIPLIERS.sunday2 +
+    (Number(overtime.sundayNight35) || 0) * OVERTIME_MULTIPLIERS.sundayNight35
   );
-  const grossPay = workPay + bonusPay + overtimePay;
+
+  // Phụ cấp theo ngày công, nửa ngày tính 0.5
+  const allowancePay = allowance * days;
+
+  // Cộng tất cả thu nhập trước khi tính thuế
+  const grossPay = workPay + bonusPay + overtimePay + allowancePay;
   const tax = grossPay * TAX_RATE;
 
-  return { workPay, bonusPay, overtimePay, grossPay, tax, netPay: grossPay - tax };
+  return {
+    workPay,
+    bonusPay,
+    overtimePay,
+    allowancePay,
+    grossPay,
+    tax,
+    netPay: grossPay - tax
+  };
 }

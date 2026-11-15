@@ -6,7 +6,7 @@
 - Backend: Node.js + Express
 - Database: MongoDB local qua Prisma
 - Đăng nhập JWT, phân quyền ADMIN / MANAGER / EMPLOYEE
-- Quản lý nhân viên, địa điểm công ty, ca làm, chấm công GPS, nghỉ phép, tăng ca, bảng lương và xuất Excel
+- Quản lý nhân viên, địa điểm công ty, ca làm, chấm công GPS, nghỉ phép, tăng ca, bảng công và xuất Excel
 
 ## Yêu cầu
 - Node.js 20+
@@ -51,11 +51,10 @@ Mở URL Vite hiển thị trong terminal (thường là http://localhost:5173).
 - `POST /api/attendance/punch`
 - `GET/POST /api/leaves`
 - `GET/POST /api/overtime`
-- `GET/POST /api/payroll`
-- `GET /api/payroll/export`
+- `GET /api/timesheet`
+- `GET /api/timesheet/export`
 
 ## Lưu ý nghiệp vụ
-Đây là bộ khung chạy được để phát triển tiếp. Công thức lương trong bản mẫu là công thức minh họa, 
-chưa thay thế quy chế lương, thuế, bảo hiểm hoặc quy định pháp luật. 
+Đây là bộ khung chạy được để phát triển tiếp. Hệ thống chỉ quản lý chấm công (không có lương/phụ cấp/thuế). 
 GPS trên trình duyệt yêu cầu localhost hoặc HTTPS và người dùng cấp quyền vị trí. 
 Cần kiểm thử thực tế, bổ sung audit log, backup, chính sách bảo mật và quy trình duyệt trước khi triển khai production.
