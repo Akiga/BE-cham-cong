@@ -956,6 +956,160 @@ router.patch('/attendance/:id/manual', managers, async (req, res, next) => {
     next(error);
   }
 });
+// Chỉnh sửa giờ công của một nhân viên trong một ngày (giờ vào, giờ ra, số công, giờ cộng thêm).
+// Áp dụng cho cả bản ghi chấm bằng GPS lẫn thủ công; Manager chỉ sửa nhân viên trong chi nhánh của mình.
+//  - checkInTime / checkOutTime: 'HH:mm' để đặt giờ, '' để xóa, bỏ qua (undefined) để giữ nguyên.
+//  - workFraction: 0 | 0.5 | 1 (số công của ngày).
+//  - extraHours: > 0 và ≤ 8 để đặt giờ cộng thêm, 0 hoặc '' để xóa, bỏ qua để giữ nguyên.
+router.patch('/attendance/day', managers, async (req, res, next) => {
+  try {
+    const { employeeId, date: workDate, checkInTime, checkOutTime, workFraction, extraHours, reason } = req.body || {};
+
+    if (!employeeId || !/^\d{4}-\d{2}-\d{2}$/.test(String(workDate || ''))) {
+      return res.status(400).json({ message: 'Thiếu nhân viên hoặc ngày không hợp lệ' });
+    }
+    if (!String(reason || '').trim()) {
+      return res.status(400).json({ message: 'Vui lòng nhập lý do chỉnh sửa' });
+    }
+    if (!(await canAccessEmployee(req.user, String(employeeId)))) {
+      return res.status(403).json({ message: 'Bạn không có quyền chỉnh sửa chấm công nhân viên này' });
+    }
+
+    const employee = await prisma.user.findUnique({
+      where: { id: String(employeeId) },
+      select: { id: true, locationId: true, role: true }
+    });
+    if (!employee || employee.role !== 'EMPLOYEE') {
+      return res.status(404).json({ message: 'Không tìm thấy nhân viên' });
+    }
+
+    const clockOk = v => /^([01]\d|2[0-3]):[0-5]\d$/.test(String(v));
+    for (const v of [checkInTime, checkOutTime]) {
+      if (v !== undefined && v !== null && v !== '' && !clockOk(v)) {
+        return res.status(400).json({ message: 'Giờ vào/ra không hợp lệ' });
+      }
+    }
+
+    let fraction;
+    if (workFraction !== undefined && workFraction !== null && workFraction !== '') {
+      fraction = Number(workFraction);
+      if (![0, 0.5, 1].includes(fraction)) {
+        return res.status(400).json({ message: 'Số công chỉ được là 0, 0,5 hoặc 1' });
+      }
+    }
+
+    let extra;
+    if (extraHours !== undefined && extraHours !== null && extraHours !== '') {
+      extra = Number(extraHours);
+      if (!Number.isFinite(extra) || extra < 0 || extra > 8) {
+        return res.status(400).json({ message: 'Giờ cộng thêm phải từ 0 đến 8 giờ' });
+      }
+    } else if (extraHours === '') {
+      extra = 0;
+    }
+
+    const dayStart = new Date(`${workDate}T00:00:00+07:00`);
+    const dayEnd = new Date(dayStart.getTime() + 86400000);
+    const makeDate = clock => new Date(`${workDate}T${clock}:00+07:00`);
+    const reasonText = String(reason).trim();
+
+    const existing = await prisma.attendanceRecord.findMany({
+      where: { userId: employee.id, timestamp: { gte: dayStart, lt: dayEnd } },
+      orderBy: { timestamp: 'asc' }
+    });
+    const ins = existing.filter(r => r.type === 'CHECK_IN');
+    const outs = existing.filter(r => r.type === 'CHECK_OUT');
+
+    // Giờ vào/ra sau khi chỉnh để kiểm tra thứ tự
+    const resolve = (value, rows, pick) => {
+      if (value === undefined || value === null) return rows.length ? pick(rows).timestamp : null;
+      if (value === '') return null;
+      return makeDate(value);
+    };
+    const finalIn = resolve(checkInTime, ins, rows => rows[0]);
+    const finalOut = resolve(checkOutTime, outs, rows => rows[rows.length - 1]);
+    if (finalIn && finalOut && finalOut <= finalIn) {
+      return res.status(400).json({ message: 'Giờ ra phải sau giờ vào' });
+    }
+
+    const noteOf = row => `${row.note ? `${row.note} | ` : ''}Điều chỉnh: ${reasonText}`;
+    const baseFraction = fraction ?? 1;
+
+    // type: 'CHECK_IN' | 'CHECK_OUT'; value: undefined = giữ nguyên
+    const apply = async (type, value, rows, pickTarget) => {
+      if (value === undefined || value === null) return;
+      if (value === '') {
+        for (const row of rows) await prisma.attendanceRecord.delete({ where: { id: row.id } });
+        return;
+      }
+      const stamp = makeDate(value);
+      if (rows.length) {
+        const target = pickTarget(rows);
+        const extras = rows.filter(r => r.id !== target.id);
+        for (const row of extras) await prisma.attendanceRecord.delete({ where: { id: row.id } });
+        // Giờ không đổi (tính theo phút) thì giữ nguyên bản ghi gốc
+        if (Math.floor(new Date(target.timestamp).getTime() / 60000) === Math.floor(stamp.getTime() / 60000)) return;
+        await prisma.attendanceRecord.update({
+          where: { id: target.id },
+          data: { timestamp: stamp, source: 'MANUAL', note: noteOf(target), updatedById: req.user.id }
+        });
+      } else {
+        await prisma.attendanceRecord.create({
+          data: {
+            userId: employee.id,
+            locationId: employee.locationId || null,
+            type,
+            timestamp: stamp,
+            note: `Chấm công thủ công: ${reasonText}`,
+            source: 'MANUAL',
+            workFraction: baseFraction,
+            createdById: req.user.id
+          }
+        });
+      }
+    };
+
+    await apply('CHECK_IN', checkInTime, ins, rows => rows[0]);
+    await apply('CHECK_OUT', checkOutTime, outs, rows => rows[rows.length - 1]);
+
+    if (fraction !== undefined) {
+      await prisma.attendanceRecord.updateMany({
+        where: { userId: employee.id, timestamp: { gte: dayStart, lt: dayEnd } },
+        data: { workFraction: fraction, updatedById: req.user.id }
+      });
+    }
+
+    if (extra !== undefined) {
+      const current = await prisma.extraHourRecord.findFirst({
+        where: { userId: employee.id, workDate: { gte: dayStart, lt: dayEnd } }
+      });
+      if (extra === 0) {
+        if (current) await prisma.extraHourRecord.delete({ where: { id: current.id } });
+      } else if (current) {
+        await prisma.extraHourRecord.update({
+          where: { id: current.id },
+          data: { hours: Number(extra.toFixed(2)), reason: reasonText }
+        });
+      } else {
+        await prisma.extraHourRecord.create({
+          data: {
+            userId: employee.id,
+            locationId: employee.locationId || null,
+            workDate: new Date(`${workDate}T12:00:00+07:00`),
+            hours: Number(extra.toFixed(2)),
+            reason: reasonText,
+            createdById: req.user.id
+          }
+        });
+      }
+    }
+
+    res.json({ message: 'Đã cập nhật giờ công' });
+  } catch (error) {
+    next(error);
+  }
+});
+
 // Nhập giờ cộng thêm thủ công (ví dụ làm xuyên trưa); Manager chỉ thao tác trong chi nhánh của mình.
 // Đây là giờ cộng thêm, KHÔNG phải tăng ca.
 router.post('/extra-hours', managers, async (req, res, next) => {

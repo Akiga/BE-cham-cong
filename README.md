@@ -51,6 +51,7 @@ Mở URL Vite hiển thị trong terminal (thường là http://localhost:5173).
 - `POST /api/attendance/punch`
 - `GET/POST /api/leaves`
 - `GET/POST /api/overtime`
+- `PATCH /api/attendance/day` (Admin/Manager chỉnh sửa giờ vào, giờ ra, số công, giờ cộng thêm của nhân viên theo ngày)
 - `GET /api/timesheet`
 - `GET /api/timesheet/export`
 
